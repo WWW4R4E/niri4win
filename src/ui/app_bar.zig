@@ -1,11 +1,59 @@
 const std = @import("std");
-
 const niri4win = @import("../root.zig");
 const win32 = niri4win.win32;
 
-var g_fUpdating: bool = false;
+var g_fUpdating = false;
+var g_hShellTrayWnd: ?win32.HWND = null;
+
+var g_show_taskbar: bool = true;
+
+fn findShellTrayWnd() ?win32.HWND {
+    return win32.FindWindowA("Shell_TrayWnd", null);
+}
+
+fn hideShellTray() void {
+    if (g_show_taskbar) return;
+
+    const hwnd = findShellTrayWnd() orelse return;
+
+    var abd = std.mem.zeroes(win32.APPBARDATA);
+    abd.cbSize = @sizeOf(win32.APPBARDATA);
+    abd.hWnd = hwnd;
+    abd.lParam = 1;
+    _ = win32.SHAppBarMessage(win32.ABM_SETSTATE, &abd);
+    _ = win32.ShowWindow(hwnd, win32.SW_HIDE);
+    const hrgn = win32.CreateRectRgn(0, 0, 0, 0);
+    _ = win32.SetWindowRgn(hwnd, hrgn, win32.TRUE);
+
+    const hwnd_sec = win32.FindWindowA("Shell_SecondaryTrayWnd", null);
+    if (hwnd_sec) |sec| {
+        _ = win32.ShowWindow(sec, win32.SW_HIDE);
+    }
+}
+
+fn showShellTray() void {
+    if (g_show_taskbar) return;
+
+    const hwnd = win32.FindWindowA("Shell_TrayWnd", null);
+    if (hwnd) |h| {
+        _ = win32.SetWindowRgn(h, null, win32.TRUE);
+        var abd = std.mem.zeroes(win32.APPBARDATA);
+        abd.cbSize = @sizeOf(win32.APPBARDATA);
+        abd.hWnd = h;
+        abd.lParam = 2;
+        _ = win32.SHAppBarMessage(win32.ABM_SETSTATE, &abd);
+        _ = win32.ShowWindow(h, win32.SW_SHOW);
+    }
+
+    const hwnd_sec = win32.FindWindowA("Shell_SecondaryTrayWnd", null);
+    if (hwnd_sec) |sec| {
+        _ = win32.ShowWindow(sec, win32.SW_SHOW);
+    }
+}
 
 pub fn register(hwnd: win32.HWND, size: i32, edge: u32) bool {
+    hideShellTray();
+
     var abd: win32.APPBARDATA = undefined;
     abd.cbSize = @sizeOf(win32.APPBARDATA);
     abd.hWnd = hwnd;
@@ -23,6 +71,8 @@ pub fn unregister(hwnd: win32.HWND) void {
     abd.cbSize = @sizeOf(win32.APPBARDATA);
     abd.hWnd = hwnd;
     _ = win32.SHAppBarMessage(win32.ABM_REMOVE, &abd);
+
+    showShellTray();
 }
 
 pub fn updatePosition(hwnd: win32.HWND, size: i32, edge: u32) void {

@@ -25,10 +25,6 @@ pub const D2DContext = struct {
     img_h: u32,
     d3d_device: *win32.ID3D11Device,
     d3d_context: *win32.ID3D11DeviceContext,
-    brush_active_fill: ?*win32.ID2D1SolidColorBrush,
-    brush_active_border: ?*win32.ID2D1SolidColorBrush,
-    brush_inactive_fill: ?*win32.ID2D1SolidColorBrush,
-    brush_inactive_border: ?*win32.ID2D1SolidColorBrush,
     // Acrylic resources
     wallpaper_bmp: ?*win32.ID2D1Bitmap1,
     noise_bmp: ?*win32.ID2D1Bitmap1,
@@ -122,10 +118,6 @@ pub const D2DContext = struct {
             .img_h = 0,
             .d3d_device = d3d_device.?,
             .d3d_context = d3d_context.?,
-            .brush_active_fill = null,
-            .brush_active_border = null,
-            .brush_inactive_fill = null,
-            .brush_inactive_border = null,
             .wallpaper_bmp = null,
             .noise_bmp = null,
             .blur_effect = null,
@@ -145,10 +137,6 @@ pub const D2DContext = struct {
     pub fn deinit(self: *D2DContext) void {
         if (self.bg_blur) |e| _ = (@as(*const U, @ptrCast(e))).Release();
         if (self.bg) |b| _ = (@as(*const U, @ptrCast(b))).Release();
-        if (self.brush_active_fill) |b| _ = (@as(*const U, @ptrCast(b))).Release();
-        if (self.brush_active_border) |b| _ = (@as(*const U, @ptrCast(b))).Release();
-        if (self.brush_inactive_fill) |b| _ = (@as(*const U, @ptrCast(b))).Release();
-        if (self.brush_inactive_border) |b| _ = (@as(*const U, @ptrCast(b))).Release();
         if (self.wallpaper_bmp) |b| _ = (@as(*const U, @ptrCast(b))).Release();
         if (self.noise_bmp) |b| _ = (@as(*const U, @ptrCast(b))).Release();
         if (self.blur_effect) |e| _ = (@as(*const U, @ptrCast(e))).Release();
@@ -556,4 +544,25 @@ pub const D2DContext = struct {
         defer _ = (@as(*const U, @ptrCast(output.?))).Release();
         self.ctx.DrawImage(output.?, null, null, .LINEAR, .SOURCE_OVER);
     }
+
+    // ─── D2D 便利方法 ────────────────────────────
+
+    pub fn fillRoundedRect(self: *D2DContext, rect: win32.D2D_RECT_F, radius: f32, brush: *win32.ID2D1Brush) void {
+        const rr = win32.D2D1_ROUNDED_RECT{ .rect = rect, .radiusX = radius, .radiusY = radius };
+        self.ctx.ID2D1RenderTarget.FillRoundedRectangle(&rr, brush);
+    }
+
+    pub fn drawRoundedRect(self: *D2DContext, rect: win32.D2D_RECT_F, radius: f32, brush: *win32.ID2D1Brush, width: f32) void {
+        const rr = win32.D2D1_ROUNDED_RECT{ .rect = rect, .radiusX = radius, .radiusY = radius };
+        self.ctx.ID2D1RenderTarget.DrawRoundedRectangle(&rr, brush, width, null);
+    }
+
+    pub fn drawBitmap(self: *D2DContext, bmp: *win32.ID2D1Bitmap, rect: *const win32.D2D_RECT_F, opacity: f32) void {
+        self.ctx.ID2D1RenderTarget.DrawBitmap(bmp, rect, opacity, win32.D2D1_BITMAP_INTERPOLATION_MODE.LINEAR, null);
+    }
+
+    pub fn fillRect(self: *D2DContext, rect: win32.D2D_RECT_F, brush: *win32.ID2D1Brush) void {
+        self.ctx.ID2D1RenderTarget.FillRectangle(&rect, brush);
+    }
+
 };

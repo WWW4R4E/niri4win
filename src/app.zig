@@ -10,6 +10,9 @@ const input = niri4win.input;
 const config = niri4win.config;
 const types = niri4win.types;
 const d2d = niri4win.ui.d2d;
+const state = niri4win.ui.state;
+const brushes = niri4win.ui.brushes;
+const MainBarPainter = niri4win.ui.main_bar_painter.MainBarPainter;
 
 // ─── 功能分割开关 ─────────────────────────────
 // 设为 true 启用对应功能，false 关闭。方便单独测试 bar / 窗口排布。
@@ -17,11 +20,8 @@ const ENABLE_BAR: bool = true; // acrylic 背景 + 工作区图标绘制
 const ENABLE_TILING: bool = true; // 窗口平铺管理（虚拟桌面同步、焦点、移动等）
 // ─────────────────────────────────────────────
 
-var g_tiling_manager: ?*tiling.Manager = null;
-var g_desktop_manager: ?*desktop.Manager = null;
-var g_app: ?*App = null;
-var g_d2d: ?d2d.D2DContext = null;
-var g_prev_fs: bool = false; // 全屏状态防抖
+var g_app: *App = undefined;
+var g_main_bar: ?MainBarPainter = null;
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -46,9 +46,6 @@ pub const App = struct {
         } else |err| {
             std.log.scoped(.App).err("桌面管理器初始化失败: {}", .{err});
         }
-
-        g_tiling_manager = &tiling_manager;
-        g_desktop_manager = desktop_manager;
 
         return App{
             .allocator = allocator,
@@ -199,57 +196,35 @@ pub const App = struct {
         std.log.scoped(.App).info("清理 niri4win...", .{});
 
         self.tiling_manager.deinit();
-
         if (self.desktop_manager) |dm| {
             dm.deinit(self.allocator);
         }
-
-        g_tiling_manager = null;
-        g_desktop_manager = null;
     }
 
     pub fn run(self: *App) !void {
         g_app = self;
-        defer g_app = null;
 
         const hinstance = win32.GetModuleHandleA(null) orelse return error.GetModuleHandleFailed;
-
         input.init();
         input.registerHotkeys();
         defer input.deinit();
 
         self.hwnd = try createAppBarWindow(hinstance);
 
-        // 初始化 Direct2D
-        {
-            var cr: win32.RECT = undefined;
-            _ = win32.GetClientRect(self.hwnd.?, &cr);
-            const cw = @as(u32, @intCast(cr.right - cr.left));
-            const ch = @as(u32, @intCast(cr.bottom - cr.top));
-            g_d2d = d2d.D2DContext.init(self.hwnd.?, cw, ch) catch |err| brk: {
-                std.log.scoped(.App).err("D2D初始化失败: {}", .{err});
-                break :brk null;
-            };
-            // 预加载 acrylic（壁纸+噪声+effect 链），避免首次 WM_PAINT 空转
-            if (g_d2d) |*ctx| ctx.initAcrylic();
-        }
-
-        // D2D 就绪后再显示窗口，避免白屏
+        g_main_bar = MainBarPainter.init(self.hwnd.?) catch |err| brk: {
+            std.log.scoped(.App).err("MainBarPainter 初始化失败: {}", .{err});
+            break :brk null;
+        };
         _ = win32.ShowWindow(self.hwnd.?, win32.SW_SHOW);
 
         if (ENABLE_TILING) {
             self.syncWindowsFromViews();
-
             const current_idx = if (self.desktop_manager) |dm| dm.getCurrentDesktopIndex() catch 0 else 0;
             if (current_idx > 0) {
                 try self.tiling_manager.switchWorkspace(current_idx);
             }
         }
-
-        if (self.hwnd) |hw| {
-            _ = win32.InvalidateRect(hw, null, 1);
-        }
-
+        _ = win32.InvalidateRect(self.hwnd.?, null, 1);
         std.log.scoped(.App).info("启动后工作区数: {d}, 当前工作区窗口数: {d}", .{ self.tiling_manager.getWorkspaceCount(), self.tiling_manager.getWindowCount() });
 
         self.tiling_manager.markInitialized();
@@ -266,7 +241,6 @@ pub const App = struct {
                     self.running = false;
                     break;
                 }
-
                 _ = win32.TranslateMessage(&msg);
                 _ = win32.DispatchMessageA(&msg);
             }
@@ -300,23 +274,6 @@ pub const App = struct {
                     _ = win32.InvalidateRect(hw, null, 1);
                 }
             }
-
-            // 全屏窗口检测 → 自动隐藏/显示 appbar
-            // const fg = win32.GetForegroundWindow();
-            // const fg_fs = (fg != null) and ui.task_bar.isFullscreenWindow(fg.?);
-            // if (fg_fs and !g_prev_fs) {
-            //     g_prev_fs = true;
-            //     if (self.hwnd) |hw| {
-            //         _ = win32.ShowWindow(hw, win32.SW_HIDE);
-            //     }
-            // } else if (!fg_fs and g_prev_fs) {
-            //     g_prev_fs = false;
-            //     if (self.hwnd) |hw| {
-            //         _ = win32.ShowWindow(hw, win32.SW_SHOW);
-            //         _ = win32.InvalidateRect(hw, null, 1);
-            //     }
-            // }
-
             _ = win32.Sleep(1);
         }
 
@@ -327,6 +284,7 @@ pub const App = struct {
         switch (action) {
             .none => {},
             .quit => {
+                ui.app_bar.unregister(self.hwnd.?);
                 std.log.scoped(.App).info("收到退出指令，程序退出", .{});
                 self.running = false;
             },
@@ -494,280 +452,96 @@ fn windowProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     switch (msg) {
         win32.WM_ERASEBKGND => return 1,
         win32.WM_PAINT => {
-            if (g_d2d) |*d2d_ctx| {
-                d2d_ctx.beginDraw();
-
-                if (g_app) |app| {
-                    if (!ENABLE_BAR) {
-                        d2d_ctx.endDraw();
-                        return 0;
-                    }
-                    const icon_size: f32 = 24.0;
-                    const padding: f32 = 8.0;
-                    const ws_pad: f32 = 8.0;
-                    const ws_margin: f32 = 4.0;
-                    const corner_r: f32 = 6.0;
-                    var curr_x: f32 = padding;
-                    var curr_y: f32 = padding;
-
-                    var client: win32.RECT = undefined;
-                    _ = win32.GetClientRect(hwnd, &client);
-                    const ww: f32 = @floatFromInt(client.right - client.left);
-
-                    const cur_ws = app.tiling_manager.current;
-                    const dc = if (app.desktop_manager) |dm| dm.getDesktopCount() else @max(app.tiling_manager.getWorkspaceCount(), 1);
-                    const disp_c = @max(dc, app.tiling_manager.getWorkspaceCount());
-
-                    var wi: usize = 0;
-                    while (wi < disp_c) : (wi += 1) {
-                        if (wi >= app.tiling_manager.workspaces.items.len) break;
-                        const ws = &app.tiling_manager.workspaces.items[wi];
-                        const is_cur = (wi == cur_ws);
-                        const hw = ws.columns.items.len > 0;
-
-                        const wsw = if (hw)
-                            @as(f32, @floatFromInt(ws.columns.items.len)) * (icon_size + padding) + ws_pad * 2.0
-                        else
-                            icon_size + ws_pad * 2.0;
-                        const wsh = icon_size + ws_pad * 2.0;
-
-                        const rr = win32.D2D1_ROUNDED_RECT{
-                            .rect = .{ .left = curr_x, .top = curr_y, .right = curr_x + wsw, .bottom = curr_y + wsh },
-                            .radiusX = corner_r,
-                            .radiusY = corner_r,
-                        };
-
-                        if (is_cur) {
-                            if (d2d_ctx.brush_active_fill == null) {
-                                var b2: ?*win32.ID2D1SolidColorBrush = null;
-                                _ = d2d_ctx.ctx.ID2D1RenderTarget.CreateSolidColorBrush(&.{ .r = 68.0 / 255.0, .g = 51.0 / 255.0, .b = 51.0 / 255.0, .a = 1.0 }, null, @ptrCast(&b2));
-                                d2d_ctx.brush_active_fill = b2;
-                            }
-                            if (d2d_ctx.brush_active_border == null) {
-                                var b2: ?*win32.ID2D1SolidColorBrush = null;
-                                _ = d2d_ctx.ctx.ID2D1RenderTarget.CreateSolidColorBrush(&.{ .r = 1.0, .g = 102.0 / 255.0, .b = 102.0 / 255.0, .a = 1.0 }, null, @ptrCast(&b2));
-                                d2d_ctx.brush_active_border = b2;
-                            }
-                            if (d2d_ctx.brush_active_fill) |bf|
-                                d2d_ctx.ctx.ID2D1RenderTarget.FillRoundedRectangle(&rr, @ptrCast(bf));
-                            if (d2d_ctx.brush_active_border) |bb|
-                                d2d_ctx.ctx.ID2D1RenderTarget.DrawRoundedRectangle(&rr, @ptrCast(bb), 2.0, null);
-                        } else {
-                            if (d2d_ctx.brush_inactive_fill == null) {
-                                var b2: ?*win32.ID2D1SolidColorBrush = null;
-                                _ = d2d_ctx.ctx.ID2D1RenderTarget.CreateSolidColorBrush(&.{ .r = 34.0 / 255.0, .g = 34.0 / 255.0, .b = 34.0 / 255.0, .a = 1.0 }, null, @ptrCast(&b2));
-                                d2d_ctx.brush_inactive_fill = b2;
-                            }
-                            if (d2d_ctx.brush_inactive_border == null) {
-                                var b2: ?*win32.ID2D1SolidColorBrush = null;
-                                _ = d2d_ctx.ctx.ID2D1RenderTarget.CreateSolidColorBrush(&.{ .r = 51.0 / 255.0, .g = 51.0 / 255.0, .b = 51.0 / 255.0, .a = 1.0 }, null, @ptrCast(&b2));
-                                d2d_ctx.brush_inactive_border = b2;
-                            }
-                            if (d2d_ctx.brush_inactive_fill) |bf|
-                                d2d_ctx.ctx.ID2D1RenderTarget.FillRoundedRectangle(&rr, @ptrCast(bf));
-                            if (d2d_ctx.brush_inactive_border) |bb|
-                                d2d_ctx.ctx.ID2D1RenderTarget.DrawRoundedRectangle(&rr, @ptrCast(bb), 1.0, null);
-                        }
-
-                        var ix: f32 = curr_x + ws_pad;
-                        const iy: f32 = curr_y + ws_pad;
-                        for (ws.columns.items, 0..) |col, i| {
-                            const is_foc = (wi == cur_ws and i == ws.focused);
-                            const ds: f32 = if (is_foc) 28.0 else icon_size;
-                            const ox: f32 = if (is_foc) (icon_size - ds) / 2.0 else 0.0;
-                            const oy: f32 = if (is_foc) (icon_size - ds) / 2.0 else 0.0;
-
-                            if (col.window.icon) |icn| {
-                                if (d2d_ctx.hiconToBitmap(icn)) |bmp| {
-                                    defer _ = bmp.IUnknown.Release();
-                                    const dr = win32.D2D_RECT_F{ .left = ix + ox, .top = iy + oy, .right = ix + ox + ds, .bottom = iy + oy + ds };
-                                    d2d_ctx.ctx.ID2D1RenderTarget.DrawBitmap(bmp, &dr, 1.0, .LINEAR, null);
-                                } else |_| {}
-                            }
-                            ix += icon_size + padding;
-                        }
-
-                        curr_x += wsw + ws_margin;
-                        if (curr_x + wsw > ww - padding) {
-                            curr_x = padding;
-                            curr_y += wsh + ws_margin;
-                        }
-                    }
-
-                    const rf = win32.GetForegroundWindow();
-                    if (rf != null) {
-                        const ir: f32 = 24.0;
-                        const rx = ww - ir - padding;
-                        const ry = padding;
-                        const ricon = ui.task_bar.getWindowIcon(rf.?);
-                        if (ricon) |icn| {
-                            if (d2d_ctx.hiconToBitmap(icn)) |b| {
-                                defer _ = b.IUnknown.Release();
-                                const dr = win32.D2D_RECT_F{ .left = rx, .top = ry, .right = rx + ir, .bottom = ry + ir };
-                                d2d_ctx.ctx.ID2D1RenderTarget.DrawBitmap(b, &dr, 1.0, .LINEAR, null);
-                            } else |_| {}
-                        }
-                    }
-                }
-
-                d2d_ctx.endDraw();
+            if (g_main_bar) |*p| {
+                if (!ENABLE_BAR) return 0;
+                p.render(&state.AppState{
+                    .tiling = &g_app.tiling_manager,
+                    .foreground = win32.GetForegroundWindow(),
+                    .timestamp = 0,
+                });
             }
             return 0;
         },
         win32.WM_LBUTTONDOWN => {
-            if (g_app) |app| {
-                const x = @as(i32, @intCast(lparam & 0xFFFF));
-                const y = @as(i32, @intCast((lparam >> 16) & 0xFFFF));
+            const x: f32 = @floatFromInt(@as(i32, @intCast(lparam & 0xFFFF)));
+            const y: f32 = @floatFromInt(@as(i32, @intCast((lparam >> 16) & 0xFFFF)));
 
-                const icon_size: i32 = 24;
-                const padding: i32 = 8;
-                const ws_pad: i32 = 8;
-                const ws_margin: i32 = 4;
-                var curr_x: i32 = padding;
-                var curr_y: i32 = padding;
-
-                var clicked_ws: ?usize = null;
-                var clicked_window: ?win32.HWND = null;
-
-                const desktop_count = if (app.desktop_manager) |dm| dm.getDesktopCount() else blk: {
-                    break :blk @max(app.tiling_manager.getWorkspaceCount(), 1);
-                };
-                const display_count = @max(desktop_count, app.tiling_manager.getWorkspaceCount());
-
-                var ws_i: usize = 0;
-                while (ws_i < display_count) : (ws_i += 1) {
-                    if (ws_i >= app.tiling_manager.workspaces.items.len) break;
-                    const ws = &app.tiling_manager.workspaces.items[ws_i];
-                    const has_windows = ws.columns.items.len > 0;
-
-                    const ws_w = if (has_windows)
-                        @as(i32, @intCast(ws.columns.items.len)) * (icon_size + padding) + ws_pad * 2
-                    else
-                        icon_size + ws_pad * 2;
-                    const ws_h = icon_size + ws_pad * 2;
-
-                    const ws_left = curr_x;
-                    const ws_top = curr_y;
-                    const ws_right = curr_x + ws_w;
-                    const ws_bottom = curr_y + ws_h;
-
-                    if (x >= ws_left and x < ws_right and y >= ws_top and y < ws_bottom) {
-                        clicked_ws = ws_i;
-
-                        var icon_x: i32 = curr_x + ws_pad;
-                        for (ws.columns.items) |col| {
-                            const icon_right = icon_x + icon_size;
-                            const icon_bottom = curr_y + ws_pad + icon_size;
-                            if (x >= icon_x and x < icon_right and y >= curr_y + ws_pad and y < icon_bottom) {
-                                clicked_window = col.window.hwnd;
-                                break;
-                            }
-                            icon_x += icon_size + padding;
-                        }
-                        break;
-                    }
-
-                    curr_x += ws_w + ws_margin;
-                    var rect_check: win32.RECT = undefined;
-                    _ = win32.GetClientRect(hwnd, &rect_check);
-                    const ww = rect_check.right - rect_check.left;
-                    if (curr_x + ws_w > ww - padding) {
-                        curr_x = padding;
-                        curr_y += ws_h + ws_margin;
-                    }
-                }
-
-                if (clicked_window) |hw| {
+            const hit = if (g_main_bar) |*p| p.hitTest(x, y) else null;
+            if (hit) |h| {
+                if (h.window_hwnd) |hw| {
+                    // 点击了某个窗口图标 → 聚焦该窗口
                     var title_buf: [256:0]u8 = std.mem.zeroes([256:0]u8);
                     _ = win32.GetWindowTextA(hw, &title_buf, @intCast(title_buf.len));
                     std.log.scoped(.App).info("点击窗口: 0x{X} \"{s}\"", .{ @intFromPtr(hw), &title_buf });
 
-                    var found_ws: ?usize = null;
-                    var found_col: ?usize = null;
-                    for (app.tiling_manager.workspaces.items, 0..) |*ws, ws_idx| {
-                        if (ws.findColumn(hw)) |col_idx| {
-                            found_ws = ws_idx;
-                            found_col = col_idx;
-                            break;
-                        }
-                    }
-
-                    if (found_ws) |ws_idx| {
-                        if (found_col) |col_idx| {
-                            if (ws_idx != app.tiling_manager.current) {
-                                if (app.desktop_manager) |dm| {
-                                    var count = dm.getDesktopCount();
-                                    while (ws_idx >= count) : (count += 1) {
-                                        std.log.scoped(.App).info("创建新桌面 {d}", .{count + 1});
-                                        dm.createNewDesktop() catch {};
-                                    }
-                                    if (ws_idx < count) {
-                                        dm.switchToDesktopByIndex(ws_idx) catch {};
-                                    }
+                    const ws_idx = h.ws_idx;
+                    const tiling_mgr = &g_app.tiling_manager;
+                    const ws = &tiling_mgr.workspaces.items[ws_idx];
+                    if (ws.findColumn(hw)) |col_idx| {
+                        if (ws_idx != tiling_mgr.current) {
+                            if (g_app.desktop_manager) |dm| {
+                                var count = dm.getDesktopCount();
+                                while (ws_idx >= count) : (count += 1) {
+                                    dm.createNewDesktop() catch {};
                                 }
-                                app.tiling_manager.current = ws_idx;
+                                if (ws_idx < count) dm.switchToDesktopByIndex(ws_idx) catch {};
                             }
+                            tiling_mgr.current = ws_idx;
+                        }
+                        ws.focused = col_idx;
+                        _ = win32.ShowWindow(hw, win32.SW_RESTORE);
 
-                            const workspace = app.tiling_manager.ws();
-                            workspace.focused = col_idx;
-                            _ = win32.ShowWindow(hw, win32.SW_RESTORE);
-
-                            var old_lock_timeout: u32 = 0;
-                            _ = win32.SystemParametersInfoA(win32.SPI_GETFOREGROUNDLOCKTIMEOUT, 0, @ptrCast(&old_lock_timeout), .{});
-                            _ = win32.SystemParametersInfoA(win32.SPI_SETFOREGROUNDLOCKTIMEOUT, 0, null, win32.SPIF_SENDCHANGE);
-                            tiling.Manager.bypassForegroundLock();
-                            _ = win32.BringWindowToTop(hw);
-
-                            if (app.desktop_manager) |dm| {
-                                if (dm.appViewCollection) |collection| {
-                                    var view: ?*virtual_desktop.IApplicationView = null;
-                                    if (collection.GetViewForHwnd(hw, @ptrCast(&view)) == 0 and view != null) {
-                                        _ = view.?.SetFocus();
-                                        _ = view.?.Release();
-                                    }
+                        var old_lock: u32 = 0;
+                        _ = win32.SystemParametersInfoA(win32.SPI_GETFOREGROUNDLOCKTIMEOUT, 0, @ptrCast(&old_lock), .{});
+                        _ = win32.SystemParametersInfoA(win32.SPI_SETFOREGROUNDLOCKTIMEOUT, 0, null, win32.SPIF_SENDCHANGE);
+                        tiling.Manager.bypassForegroundLock();
+                        _ = win32.BringWindowToTop(hw);
+                        if (g_app.desktop_manager) |dm| {
+                            if (dm.appViewCollection) |collection| {
+                                var view: ?*virtual_desktop.IApplicationView = null;
+                                if (collection.GetViewForHwnd(hw, @ptrCast(&view)) == 0 and view != null) {
+                                    _ = view.?.SetFocus();
+                                    _ = view.?.Release();
                                 }
                             }
-
-                            tiling.Manager.restoreForegroundLock();
-                            _ = win32.SystemParametersInfoA(win32.SPI_SETFOREGROUNDLOCKTIMEOUT, old_lock_timeout, null, win32.SPIF_SENDCHANGE);
-
-                            app.tiling_manager.arrange();
-                            _ = win32.InvalidateRect(hwnd, null, 1);
                         }
+                        tiling.Manager.restoreForegroundLock();
+                        _ = win32.SystemParametersInfoA(win32.SPI_SETFOREGROUNDLOCKTIMEOUT, old_lock, null, win32.SPIF_SENDCHANGE);
+
+                        tiling_mgr.arrange();
+                        _ = win32.InvalidateRect(hwnd, null, 1);
                     }
-                } else if (clicked_ws) |ws_idx| {
-                    std.log.scoped(.App).info("点击工作区: {d}", .{ws_idx});
-                    if (app.desktop_manager) |dm| {
+                } else {
+                    // 点击了工作区空白区域 → 切换到该工作区
+                    const idx = h.ws_idx;
+                    std.log.scoped(.App).info("点击工作区: {d}", .{idx});
+                    if (g_app.desktop_manager) |dm| {
                         var count = dm.getDesktopCount();
-                        while (ws_idx >= count) : (count += 1) {
-                            std.log.scoped(.App).info("创建新桌面 {d}", .{count + 1});
+                        while (idx >= count) : (count += 1) {
                             dm.createNewDesktop() catch |err| {
                                 std.log.scoped(.App).err("创建桌面失败: {}", .{err});
                                 break;
                             };
                         }
-
-                        if (ws_idx < count) {
-                            dm.switchToDesktopByIndex(ws_idx) catch |err| {
+                        if (idx < count) {
+                            dm.switchToDesktopByIndex(idx) catch |err| {
                                 std.log.scoped(.App).err("切换桌面失败: {}", .{err});
                             };
                         }
                     }
-                    app.syncWindowsFromViews();
-                    app.tiling_manager.switchWorkspace(ws_idx) catch |err| {
+                    g_app.syncWindowsFromViews();
+                    g_app.tiling_manager.switchWorkspace(idx) catch |err| {
                         std.log.scoped(.App).err("切换工作区失败: {}", .{err});
                     };
-                    app.tiling_manager.activateFocused();
+                    g_app.tiling_manager.activateFocused();
                     _ = win32.InvalidateRect(hwnd, null, 1);
                 }
             }
-
             return 0;
         },
         win32.WM_DESTROY => {
-            if (g_d2d) |*d2d_ctx| d2d_ctx.deinit();
-            g_d2d = null;
-            ui.app_bar.unregister(hwnd);
+            if (g_main_bar) |*p| p.deinit();
+            g_main_bar = null;
             win32.PostQuitMessage(0);
             return 0;
         },
@@ -816,16 +590,6 @@ fn createAppBarWindow(hinstance: win32.HINSTANCE) !win32.HWND {
         return error.CreateWindowFailed;
     }
     const hwnd_ptr = hwnd.?;
-
-    // ShowWindow 延迟到 D2D 初始化后执行，避免白屏闪烁
-    // 自绘 acrylic，不再使用 DWM ExtendFrameIntoClientArea
-    // const DWMWA_USE_IMMERSIVE_DARK_MODE: win32.DWMWINDOWATTRIBUTE = @enumFromInt(20);
-    // const DWMWA_SYSTEMBACKDROP_TYPE: win32.DWMWINDOWATTRIBUTE = @enumFromInt(38);
-    // var dark_mode: i32 = 1;
-    // _ = win32.DwmSetWindowAttribute(hwnd_ptr, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_mode, @sizeOf(i32));
-    // var backdrop_type: i32 = 3;
-    // _ = win32.DwmSetWindowAttribute(hwnd_ptr, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop_type, @sizeOf(i32));
-
     if (!ui.app_bar.register(hwnd_ptr, config.getAppBarHeight(), win32.ABE_TOP)) {
         return error.RegisterAppBarFailed;
     }
